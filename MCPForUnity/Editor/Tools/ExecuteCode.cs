@@ -32,11 +32,32 @@ namespace MCPForUnity.Editor.Tools
         private static string[] _cachedAssemblyPaths;
         private static string[] _cachedCodeDomAssemblyPaths;
 
+        // Every compile emits a fresh in-memory "MCPDynamic" assembly, and Mono cannot unload
+        // one, so recompiling an identical snippet leaks an assembly per call until the next
+        // domain reload (see issue #1351). Cache the compiled output keyed on the wrapped
+        // source so repeated calls reuse one assembly.
+        private const int MaxCompiledCacheEntries = 64;
+        private static readonly Dictionary<string, CompiledSnippet> _compiledCache =
+            new Dictionary<string, CompiledSnippet>(StringComparer.Ordinal);
+
+        private readonly struct CompiledSnippet
+        {
+            public CompiledSnippet(Assembly assembly, string compiler)
+            {
+                Assembly = assembly;
+                Compiler = compiler;
+            }
+
+            public Assembly Assembly { get; }
+            public string Compiler { get; }
+        }
+
         [UnityEditor.InitializeOnLoadMethod]
         private static void OnDomainReload()
         {
             _cachedAssemblyPaths = null;
             _cachedCodeDomAssemblyPaths = null;
+            _compiledCache.Clear();
             RoslynCompiler.ResetCache();
         }
 
@@ -181,6 +202,11 @@ namespace MCPForUnity.Editor.Tools
         private static object CompileAndExecute(string code, string compiler)
         {
             string wrappedSource = WrapUserCode(code);
+
+            string cacheKey = compiler + "\n" + wrappedSource;
+            if (_compiledCache.TryGetValue(cacheKey, out CompiledSnippet cached))
+                return InvokeCompiled(cached.Assembly, cached.Compiler);
+
             string[] assemblyPaths = GetAssemblyPaths();
 
             Assembly compiled;
@@ -221,6 +247,12 @@ namespace MCPForUnity.Editor.Tools
                     }
                     break;
             }
+
+            // Bound the cache so a stream of genuinely distinct snippets cannot itself become
+            // the leak. Clearing wholesale is enough: the entries are only a compile shortcut.
+            if (_compiledCache.Count >= MaxCompiledCacheEntries)
+                _compiledCache.Clear();
+            _compiledCache[cacheKey] = new CompiledSnippet(compiled, usedCompiler);
 
             return InvokeCompiled(compiled, usedCompiler);
         }
@@ -296,32 +328,58 @@ namespace MCPForUnity.Editor.Tools
                     }
                 }
 
+                // Compile to a controlled DLL path instead of in-memory. mcs prints a stray BOM line on
+                // stdout that Mono's CodeDom can't parse, so it fabricates a bogus error (no error number,
+                // text is just the BOM) and refuses to surface the assembly — even though mcs exits 0 and
+                // wrote the DLL. We skip that bogus error and Assembly.Load the produced DLL ourselves.
+                string outputAssemblyPath = Path.Combine(Path.GetTempPath(), $"mcp-codedom-{Guid.NewGuid():N}.dll");
                 using (var provider = new CSharpCodeProvider())
                 {
                     var parameters = new CompilerParameters
                     {
-                        GenerateInMemory = true,
+                        GenerateInMemory = false,
+                        OutputAssembly = outputAssemblyPath,
                         GenerateExecutable = false,
                         TreatWarningsAsErrors = false,
                         CompilerOptions = "@\"" + responseFilePath + "\"",
                     };
 
-                    var results = provider.CompileAssemblyFromSource(parameters, source);
-
-                    if (results.Errors.HasErrors)
+                    try
                     {
+                        var results = provider.CompileAssemblyFromSource(parameters, source);
+
+                        bool hasRealErrors = false;
                         foreach (CompilerError error in results.Errors)
                         {
-                            if (!error.IsWarning)
-                            {
-                                int userLine = Math.Max(1, error.Line - WrapperLineOffset);
-                                errors.Add($"Line {userLine}: {error.ErrorText}");
-                            }
-                        }
-                        return null;
-                    }
+                            if (error.IsWarning)
+                                continue;
 
-                    return results.CompiledAssembly;
+                            // The bogus BOM "error": no error number, text is just the BOM/whitespace.
+                            string text = (error.ErrorText ?? "").Trim('\uFEFF', ' ', '\t', '\r', '\n');
+                            if (string.IsNullOrEmpty(error.ErrorNumber) && string.IsNullOrEmpty(text))
+                                continue;
+
+                            hasRealErrors = true;
+                            int userLine = Math.Max(1, error.Line - WrapperLineOffset);
+                            errors.Add($"Line {userLine}: {error.ErrorText}");
+                        }
+
+                        if (hasRealErrors)
+                            return null;
+
+                        if (!File.Exists(outputAssemblyPath))
+                        {
+                            errors.Add("CodeDom reported success but produced no assembly.");
+                            return null;
+                        }
+
+                        return Assembly.Load(File.ReadAllBytes(outputAssemblyPath));
+                    }
+                    finally
+                    {
+                        try { if (File.Exists(outputAssemblyPath)) File.Delete(outputAssemblyPath); }
+                        catch { /* best effort cleanup */ }
+                    }
                 }
             }
             finally
